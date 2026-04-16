@@ -6,7 +6,10 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "tsx src/index.ts",
-    "test": "vitest run"
+    "test": "jest --coverage --testPathPatterns=__tests__",
+    "test:all": "jest --coverage",
+    "test:watch": "jest --watch",
+    "test:ci": "jest --coverage --ci --forceExit"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.4",
@@ -17,8 +20,11 @@
     "ws": "^8.18.1"
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "@types/node": "^22.14.1",
     "@types/ws": "^8.5.14",
+    "jest": "^30.3.0",
+    "ts-jest": "^29.4.9",
     "typescript": "^5.8.3",
     "vitest": "^4.1.4"
   }

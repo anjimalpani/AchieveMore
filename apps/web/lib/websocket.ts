@@ -31,15 +31,28 @@ export class VoiceSocket {
     const voiceServerUrl = process.env.NEXT_PUBLIC_VOICE_SERVER_URL
     if (!voiceServerUrl) {
       this.opts.onStateChange('error')
+      this.opts.onMessage({ type: 'error', code: 'config_error', message: 'Voice server URL not configured. Check NEXT_PUBLIC_VOICE_SERVER_URL.' })
       console.error('[VoiceSocket] NEXT_PUBLIC_VOICE_SERVER_URL is not set')
       return
     }
 
     // Get the current Supabase session token
-    const supabase = createClient()
-    const { data: { session } } = await supabase.auth.getSession()
+    let session
+    try {
+      const supabase = createClient()
+      const { data, error } = await supabase.auth.getSession()
+      if (error) throw error
+      session = data.session
+    } catch (err) {
+      this.opts.onStateChange('error')
+      this.opts.onMessage({ type: 'error', code: 'auth_error', message: 'Failed to retrieve session. Try signing out and back in.' })
+      console.error('[VoiceSocket] getSession failed:', err)
+      return
+    }
+
     if (!session?.access_token) {
       this.opts.onStateChange('error')
+      this.opts.onMessage({ type: 'error', code: 'no_session', message: 'Not signed in. Please refresh the page.' })
       console.error('[VoiceSocket] No active session — user not logged in')
       return
     }
@@ -47,6 +60,7 @@ export class VoiceSocket {
     // Include browser timezone so the voice server uses the correct local date
     const browserTz = encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone)
     const url = `${voiceServerUrl}?token=${encodeURIComponent(session.access_token)}&tz=${browserTz}`
+    console.log('[VoiceSocket] Connecting to', voiceServerUrl)
     this.opts.onStateChange('connecting')
 
     this.ws = new WebSocket(url)
@@ -71,13 +85,25 @@ export class VoiceSocket {
     }
 
     this.ws.onclose = (event) => {
-      console.log(`[VoiceSocket] Closed — code ${event.code}, reason: ${event.reason}`)
+      const AUTH_CODES: Record<number, string> = {
+        1008: 'Connection rejected by server (auth failed — token may be expired).',
+        4001: 'Authentication failed. Please sign out and back in.',
+        4002: 'Rate limited — too many active sessions.',
+        4003: 'Failed to load user data on the server.',
+      }
+      const reason = AUTH_CODES[event.code] ?? event.reason ?? `Closed (code ${event.code})`
+      console.log(`[VoiceSocket] Closed — code ${event.code}, reason: ${reason}`)
+      if (event.code !== 1000 && event.code !== 1001) {
+        this.opts.onMessage({ type: 'error', code: `ws_close_${event.code}`, message: reason })
+      }
       this.opts.onStateChange('disconnected')
       this.ws = null
     }
 
-    this.ws.onerror = (event) => {
-      console.error('[VoiceSocket] Error', event)
+    this.ws.onerror = () => {
+      // onerror always fires before onclose when the connection fails;
+      // the actual reason comes from the close event so we log there.
+      console.error('[VoiceSocket] WebSocket error (see close event for reason)')
       this.opts.onStateChange('error')
     }
   }

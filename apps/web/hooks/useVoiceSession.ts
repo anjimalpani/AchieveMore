@@ -7,6 +7,7 @@ import { createClient } from '@/lib/supabase'
 import type { OrbState } from '@/components/VoiceOrb'
 
 export type SessionState = 'idle' | 'connecting' | 'listening' | 'speaking' | 'error'
+export type BriefType = 'morning' | 'night' | null
 
 export interface PendingTask {
   callId: string
@@ -26,9 +27,11 @@ export interface UseVoiceSessionReturn {
   errorMessage: string | null
   pendingTasks: PendingTask[]
   isActive: boolean
-  savedCount: number           // increments on each save — use as useEffect dep to refresh task list
-  needsTasksReauth: boolean    // voice server told us Tasks scope is missing
+  savedCount: number
+  needsTasksReauth: boolean
+  briefMode: BriefType
   toggle: () => void
+  requestBrief: (type: 'morning' | 'night') => void
   confirmTask: (callId: string) => Promise<void>
   dismissTask: (callId: string) => void
 }
@@ -39,13 +42,17 @@ export function useVoiceSession(): UseVoiceSessionReturn {
   const [pendingTasks, setPendingTasks] = useState<PendingTask[]>([])
   const [savedCount, setSavedCount] = useState(0)
   const [needsTasksReauth, setNeedsTasksReauth] = useState(false)
+  const [briefMode, setBriefMode] = useState<BriefType>(null)
 
-  const socketRef = useRef<VoiceSocket | null>(null)
-  const captureRef = useRef<CaptureHandle | null>(null)
-  const playerRef = useRef<AudioPlayer | null>(null)
+  const socketRef       = useRef<VoiceSocket | null>(null)
+  const captureRef      = useRef<CaptureHandle | null>(null)
+  const playerRef       = useRef<AudioPlayer | null>(null)
+  const captureCtxRef   = useRef<AudioContext | null>(null)
   const sessionStateRef = useRef<SessionState>('idle')
+  const briefModeRef    = useRef<BriefType>(null)
 
   useEffect(() => { sessionStateRef.current = sessionState }, [sessionState])
+  useEffect(() => { briefModeRef.current = briefMode }, [briefMode])
 
   const teardown = useCallback(() => {
     captureRef.current?.stop()
@@ -54,18 +61,25 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     playerRef.current = null
     socketRef.current?.disconnect()
     socketRef.current = null
+    // Close the capture AudioContext we created during the user gesture
+    captureCtxRef.current?.close().catch(() => {})
+    captureCtxRef.current = null
     setSessionState('idle')
-    // Keep pending tasks visible after session ends — user may still want to save them
+    setBriefMode(null)
   }, [])
 
-  const toggle = useCallback(async () => {
-    if (sessionStateRef.current !== 'idle' && sessionStateRef.current !== 'error') {
-      teardown()
-      return
-    }
-
+  /** Core connect logic — shared by toggle() and requestBrief() */
+  const startSession = useCallback(async () => {
     setErrorMessage(null)
     setSessionState('connecting')
+
+    // ── Create AudioContext HERE during the user-gesture stack ──────────────
+    // This is critical: AudioContext must be created synchronously in a click
+    // handler. If created later (e.g. in a WS message callback) Chrome suspends
+    // it silently and no audio is captured.
+    const captureCtx = new AudioContext({ sampleRate: 24000 })
+    captureCtxRef.current = captureCtx
+    console.log('[session] AudioContext created in user gesture, state:', captureCtx.state)
 
     const player = new AudioPlayer()
     playerRef.current = player
@@ -73,7 +87,6 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     const socket = new VoiceSocket({
       onStateChange: (connState) => {
         if (connState === 'error') {
-          setErrorMessage('Could not connect to voice server.')
           setSessionState('error')
           teardown()
         }
@@ -84,12 +97,26 @@ export function useVoiceSession(): UseVoiceSessionReturn {
 
       onMessage: (msg: ServerMessage) => {
         switch (msg.type) {
-          case 'session.created':
+          case 'session.created': {
             if (msg.needsTasksReauth) setNeedsTasksReauth(true)
-            startCapture((chunk) => socketRef.current?.sendAudio(chunk))
+
+            // Start mic capture using the AudioContext created during the click
+            startCapture(
+              (chunk) => socketRef.current?.sendAudio(chunk),
+              captureCtxRef.current!,
+            )
               .then((handle) => {
                 captureRef.current = handle
                 setSessionState('listening')
+
+                // If we entered a brief mode, trigger the brief now
+                const mode = briefModeRef.current
+                if (mode) {
+                  console.log('[session] Triggering brief:', mode)
+                  setTimeout(() => {
+                    socketRef.current?.sendJSON({ type: 'brief.request', briefType: mode })
+                  }, 400)
+                }
               })
               .catch((err: unknown) => {
                 const isDenied = err instanceof Error && err.name === 'NotAllowedError'
@@ -98,6 +125,7 @@ export function useVoiceSession(): UseVoiceSessionReturn {
                 teardown()
               })
             break
+          }
 
           case 'voice.state':
             if (msg.state === 'speaking') setSessionState('speaking')
@@ -109,7 +137,6 @@ export function useVoiceSession(): UseVoiceSessionReturn {
               callId: msg.callId,
               task: msg.task as PendingTask['task'],
             }
-            // Deduplicate by callId in case of duplicate events
             setPendingTasks((prev) =>
               prev.some((p) => p.callId === incoming.callId) ? prev : [...prev, incoming]
             )
@@ -138,7 +165,25 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     await socket.connect()
   }, [teardown])
 
-  /** Save the task to Supabase and remove the card */
+  const toggle = useCallback(async () => {
+    if (sessionStateRef.current !== 'idle' && sessionStateRef.current !== 'error') {
+      teardown()
+      return
+    }
+    setBriefMode(null)
+    await startSession()
+  }, [teardown, startSession])
+
+  const requestBrief = useCallback(async (type: 'morning' | 'night') => {
+    if (sessionStateRef.current !== 'idle' && sessionStateRef.current !== 'error') {
+      // Session already active — inject brief request directly
+      socketRef.current?.sendJSON({ type: 'brief.request', briefType: type })
+      return
+    }
+    setBriefMode(type)
+    await startSession()
+  }, [startSession])
+
   const confirmTask = useCallback(async (callId: string) => {
     const pending = pendingTasks.find((p) => p.callId === callId)
     if (!pending) return
@@ -168,7 +213,6 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     setSavedCount((n) => n + 1)
   }, [pendingTasks])
 
-  /** Dismiss without saving */
   const dismissTask = useCallback((callId: string) => {
     setPendingTasks((prev) => prev.filter((p) => p.callId !== callId))
     socketRef.current?.sendJSON({ type: 'task.cancelled', callId })
@@ -188,7 +232,9 @@ export function useVoiceSession(): UseVoiceSessionReturn {
     isActive: sessionState !== 'idle' && sessionState !== 'error',
     savedCount,
     needsTasksReauth,
+    briefMode,
     toggle,
+    requestBrief,
     confirmTask,
     dismissTask,
   }

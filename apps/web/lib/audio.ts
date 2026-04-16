@@ -7,36 +7,76 @@ export interface CaptureHandle {
 }
 
 /**
- * Request mic access and start streaming PCM16 at 24 kHz.
- * `onChunk` is called with each raw ArrayBuffer of Int16 samples.
+ * Request mic access and start streaming PCM16 at 24 kHz to `onChunk`.
+ *
+ * IMPORTANT: `ctx` MUST be created in a user-gesture handler (button click)
+ * before calling this function. If created inside a WS/async callback the
+ * browser suspends it silently and onaudioprocess never fires.
  */
-export async function startCapture(onChunk: (pcm16: ArrayBuffer) => void): Promise<CaptureHandle> {
+export async function startCapture(
+  onChunk: (pcm16: ArrayBuffer) => void,
+  ctx: AudioContext,
+): Promise<CaptureHandle> {
+  console.log('[audio] Requesting microphone...')
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+  console.log('[audio] Mic granted')
 
-  // Request 24 kHz to match OpenAI Realtime API input format
-  const ctx = new AudioContext({ sampleRate: 24000 })
+  // Resume in case the context was created slightly before a gesture resolved
+  if (ctx.state === 'suspended') {
+    console.log('[audio] AudioContext suspended — resuming...')
+    await ctx.resume()
+  }
+  console.log('[audio] AudioContext running | sampleRate:', ctx.sampleRate, '| state:', ctx.state)
+
   const source = ctx.createMediaStreamSource(stream)
 
-  // ScriptProcessorNode is deprecated but universally supported;
-  // Phase 7 will upgrade to AudioWorklet
-  const processor = ctx.createScriptProcessor(4096, 1, 1)
+  // ── Try AudioWorklet (preferred — runs off the main thread) ─────────────────
+  try {
+    await ctx.audioWorklet.addModule('/pcm16-processor.js')
+    const worklet = new AudioWorkletNode(ctx, 'pcm16-processor')
 
-  processor.onaudioprocess = (e) => {
-    const float32 = e.inputBuffer.getChannelData(0)
-    onChunk(float32ToInt16(float32).buffer as ArrayBuffer)
-  }
+    worklet.port.onmessage = (e: MessageEvent<ArrayBuffer>) => {
+      console.log('[audio] Sending audio chunk (worklet), bytes:', e.data.byteLength)
+      onChunk(e.data)
+    }
 
-  source.connect(processor)
-  // Must connect to destination to keep the graph alive in some browsers
-  processor.connect(ctx.destination)
+    source.connect(worklet)
+    // Don't connect worklet to destination — we don't want to hear our own mic
+    console.log('[audio] Using AudioWorklet')
 
-  return {
-    stop: () => {
-      processor.disconnect()
-      source.disconnect()
-      stream.getTracks().forEach((t) => t.stop())
-      ctx.close()
-    },
+    return {
+      stop: () => {
+        console.log('[audio] Stopping capture')
+        worklet.disconnect()
+        source.disconnect()
+        stream.getTracks().forEach((t) => t.stop())
+      },
+    }
+  } catch (workletErr) {
+    // ── Fallback: ScriptProcessorNode (deprecated but universally supported) ──
+    console.warn('[audio] AudioWorklet unavailable, falling back to ScriptProcessor:', workletErr)
+
+    const processor = ctx.createScriptProcessor(4096, 1, 1)
+    processor.onaudioprocess = (e) => {
+      const float32 = e.inputBuffer.getChannelData(0)
+      const buffer = float32ToInt16(float32).buffer as ArrayBuffer
+      console.log('[audio] Sending audio chunk (ScriptProcessor), bytes:', buffer.byteLength)
+      onChunk(buffer)
+    }
+
+    source.connect(processor)
+    // Must connect to destination to keep the graph alive in some browsers
+    processor.connect(ctx.destination)
+    console.log('[audio] Using ScriptProcessor')
+
+    return {
+      stop: () => {
+        console.log('[audio] Stopping capture')
+        processor.disconnect()
+        source.disconnect()
+        stream.getTracks().forEach((t) => t.stop())
+      },
+    }
   }
 }
 
@@ -58,13 +98,17 @@ function float32ToInt16(f32: Float32Array): Int16Array {
 export class AudioPlayer {
   private ctx: AudioContext
   private nextStartTime = 0
-  private playing = false
+  private _playing = false
 
   constructor() {
     this.ctx = new AudioContext({ sampleRate: 24000 })
   }
 
   enqueue(pcm16: ArrayBuffer): void {
+    if (this.ctx.state === 'suspended') {
+      this.ctx.resume().catch(() => {})
+    }
+
     const i16 = new Int16Array(pcm16)
     const f32 = int16ToFloat32(i16)
     const buf = this.ctx.createBuffer(1, f32.length, 24000)
@@ -74,27 +118,25 @@ export class AudioPlayer {
     source.buffer = buf
     source.connect(this.ctx.destination)
 
-    // Schedule back-to-back, starting from now if queue is empty
     const startAt = Math.max(this.ctx.currentTime, this.nextStartTime)
     source.start(startAt)
     this.nextStartTime = startAt + buf.duration
-    this.playing = true
+    this._playing = true
 
     source.onended = () => {
-      if (this.nextStartTime <= this.ctx.currentTime) this.playing = false
+      if (this.nextStartTime <= this.ctx.currentTime) this._playing = false
     }
   }
 
   stop(): void {
-    this.playing = false
+    this._playing = false
     this.nextStartTime = 0
-    // Close and recreate so future enqueues work cleanly
     this.ctx.close()
     this.ctx = new AudioContext({ sampleRate: 24000 })
   }
 
   get isPlaying(): boolean {
-    return this.playing
+    return this._playing
   }
 }
 

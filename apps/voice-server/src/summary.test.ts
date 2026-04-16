@@ -1,16 +1,13 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-
 // ── Mock the openai module before importing summary ───────────────────────────
-// vi.mock is hoisted — cannot reference variables defined outside the factory
-vi.mock('openai', () => {
-  const mockCreate = vi.fn().mockResolvedValue({
+// jest.mock is hoisted — cannot reference variables defined outside the factory
+jest.mock('openai', () => {
+  const mockCreate = jest.fn().mockResolvedValue({
     choices: [{
       message: {
         content: 'You have a fairly busy day tomorrow with a team standup at 9:00 AM and a product review at 2:00 PM. Make sure to prep your notes ahead of the product review — it starts right after lunch.',
       },
     }],
   })
-  // Must be a constructible function for `new OpenAI(...)` to work
   function MockOpenAI() {
     return { chat: { completions: { create: mockCreate } } }
   }
@@ -41,7 +38,7 @@ const TWO_EVENTS: CalendarEvent[] = [
 ]
 
 describe('generateTomorrowSummary', () => {
-  beforeEach(() => vi.clearAllMocks())
+  beforeEach(() => jest.clearAllMocks())
 
   it('returns a non-empty string for a user with 2 events tomorrow', async () => {
     const result = await generateTomorrowSummary(TWO_EVENTS, TOMORROW_LABEL, TIMEZONE)

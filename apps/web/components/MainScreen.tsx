@@ -79,7 +79,8 @@ export default function MainScreen({
   const {
     orbState, errorMessage, pendingTasks, isActive, savedCount,
     needsTasksReauth: sessionNeedsTasksReauth,
-    toggle, confirmTask, dismissTask,
+    briefMode,
+    toggle, requestBrief, confirmTask, dismissTask,
   } = useVoiceSession()
 
   // Show banner if page.tsx detected it OR if the voice server confirmed it mid-session
@@ -89,14 +90,24 @@ export default function MainScreen({
     const supabase = createClient()
     const todayStart    = startOfDayUTC(tz, 0)
     const tomorrowStart = startOfDayUTC(tz, 1)
-
     supabase.from('tasks').select('*')
       .gte('due_at', todayStart).lt('due_at', tomorrowStart)
       .order('due_at', { ascending: true })
       .then(({ data }) => { if (data) setTodayTasks(data as Task[]) })
   }, [tz])
 
-  useEffect(() => { loadTasks() }, [savedCount, loadTasks])
+  // Use a cancelled flag so React StrictMode's double-invoke doesn't fire two
+  // concurrent fetches and cause a stale-state race on the second set.
+  useEffect(() => {
+    let cancelled = false
+    const supabase = createClient()
+    supabase.from('tasks').select('*')
+      .gte('due_at', startOfDayUTC(tz, 0))
+      .lt('due_at', startOfDayUTC(tz, 1))
+      .order('due_at', { ascending: true })
+      .then(({ data }) => { if (!cancelled && data) setTodayTasks(data as Task[]) })
+    return () => { cancelled = true }
+  }, [savedCount, tz])
 
   // After OAuth redirect (?calendar=connected), verify the token was stored
   // and update hasCalendar state reactively — no manual reload required.
@@ -298,23 +309,37 @@ export default function MainScreen({
               <div className="grid grid-cols-2 gap-3">
                 <Tooltip tip="Hear a spoken summary of tomorrow&apos;s schedule and anything you need to prepare tonight.">
                   <button
-                    onClick={() => alert('Night Brief \u2014 coming soon')}
-                    className="flex flex-col items-start gap-1 rounded-2xl bg-black/40 backdrop-blur-sm border border-white/10 px-4 py-4 h-[88px] hover:bg-black/55 hover:border-white/20 active:scale-95 transition-all duration-150 shadow-md text-left w-full"
+                    onClick={() => requestBrief('night')}
+                    className={[
+                      'flex flex-col items-start gap-1 rounded-2xl backdrop-blur-sm px-4 py-4 h-[88px] active:scale-95 transition-all duration-150 shadow-md text-left w-full',
+                      briefMode === 'night' && isActive
+                        ? 'bg-indigo-900/60 border-2 border-indigo-400/60'
+                        : 'bg-black/40 border border-white/10 hover:bg-black/55 hover:border-white/20',
+                    ].join(' ')}
                   >
                     <span className="text-2xl leading-none">🌙</span>
                     <span className="text-xs font-semibold text-white mt-1">Night Brief</span>
-                    <span className="text-[11px] text-white/50 leading-tight">Preview tomorrow</span>
+                    <span className="text-[11px] text-white/50 leading-tight">
+                      {briefMode === 'night' && isActive ? 'Speaking…' : 'Preview tomorrow'}
+                    </span>
                   </button>
                 </Tooltip>
 
                 <Tooltip tip="Start your day with a spoken run-through of today&apos;s priorities in time order.">
                   <button
-                    onClick={() => alert('Morning Brief \u2014 coming soon')}
-                    className="flex flex-col items-start gap-1 rounded-2xl bg-black/40 backdrop-blur-sm border border-white/10 px-4 py-4 h-[88px] hover:bg-black/55 hover:border-white/20 active:scale-95 transition-all duration-150 shadow-md text-left w-full"
+                    onClick={() => requestBrief('morning')}
+                    className={[
+                      'flex flex-col items-start gap-1 rounded-2xl backdrop-blur-sm px-4 py-4 h-[88px] active:scale-95 transition-all duration-150 shadow-md text-left w-full',
+                      briefMode === 'morning' && isActive
+                        ? 'bg-orange-900/60 border-2 border-orange-400/60'
+                        : 'bg-black/40 border border-white/10 hover:bg-black/55 hover:border-white/20',
+                    ].join(' ')}
                   >
                     <span className="text-2xl leading-none">☀️</span>
                     <span className="text-xs font-semibold text-white mt-1">Morning Brief</span>
-                    <span className="text-[11px] text-white/50 leading-tight">Review today</span>
+                    <span className="text-[11px] text-white/50 leading-tight">
+                      {briefMode === 'morning' && isActive ? 'Speaking…' : 'Review today'}
+                    </span>
                   </button>
                 </Tooltip>
               </div>

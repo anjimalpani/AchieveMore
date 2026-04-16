@@ -1,0 +1,45 @@
+name: Voice Server Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/voice-server/**'
+      - '.github/workflows/voice-server-tests.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/voice-server/**'
+      - '.github/workflows/voice-server-tests.yml'
+
+jobs:
+  test:
+    name: Jest test suite
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: apps/voice-server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: apps/voice-server
+        run: npm ci
+
+      - name: Run tests (CI mode)
+        working-directory: apps/voice-server
+        run: npm run test:ci
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: apps/voice-server/coverage/
+          retention-days: 7

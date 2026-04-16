@@ -11,6 +11,7 @@ import { handleFunctionCall } from './actions'
 import { getOAuthUrl, exchangeAndStoreTokens } from './calendar'
 import { createClient } from '@supabase/supabase-js'
 import { generateTomorrowSummary } from './summary'
+import { buildHealthResponse } from './health'
 
 const supabaseAdmin = createClient(
   process.env.SUPABASE_URL!,
@@ -22,14 +23,16 @@ const MAX_SESSION_MS = 15 * 60 * 1000  // 15 min hard cap
 const SILENCE_TIMEOUT_MS = 30 * 1000   // 30s of no audio → end session
 const MAX_SESSIONS_PER_USER = 3
 
+
 // ── HTTP server (health + calendar OAuth + WS upgrade) ───────────────────────
 const httpServer = http.createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', `http://localhost`)
 
   // Health check
   if (url.pathname === '/health') {
-    res.writeHead(200, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify({ status: 'ok', sessions: getSessionCount() }))
+    const body = buildHealthResponse()
+    res.writeHead(body.status === 'ok' ? 200 : 503, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify(body))
     return
   }
 
@@ -238,7 +241,7 @@ wss.on('connection', async (ws: WebSocket, req: IncomingMessage) => {
       resetSilenceTimer(sessionId, ws)
     } else {
       try {
-        handleControlMessage(sessionId, ws, JSON.parse(data.toString()))
+        handleControlMessage(sessionId, ws, rt, JSON.parse(data.toString()))
       } catch {
         // ignore malformed JSON
       }
@@ -259,17 +262,52 @@ wss.on('connection', async (ws: WebSocket, req: IncomingMessage) => {
 })
 
 // ── Control messages ──────────────────────────────────────────────────────────
-function handleControlMessage(sessionId: string, ws: WebSocket, msg: Record<string, unknown>) {
+function handleControlMessage(
+  sessionId: string,
+  ws: WebSocket,
+  rt: WebSocket,
+  msg: Record<string, unknown>
+) {
   switch (msg.type) {
     case 'ping':
       send(ws, { type: 'pong' })
       break
+
     case 'session.end':
       send(ws, { type: 'session.ended', reason: 'user_ended' })
       ws.close(1000, 'User ended session')
       break
+
+    // Browser requests a morning or night brief — inject a user message into the
+    // Realtime API session so the agent responds immediately with the brief.
+    case 'brief.request': {
+      const briefType = (msg.briefType as string) === 'morning' ? 'morning' : 'night'
+      console.log(`[session ${sessionId}] Brief request: ${briefType}`)
+
+      if (rt.readyState !== WebSocket.OPEN) {
+        console.warn(`[session ${sessionId}] brief.request ignored — Realtime API not open`)
+        break
+      }
+
+      const prompt = briefType === 'morning'
+        ? 'Please give me my morning brief now. Call generate_brief with type "morning".'
+        : 'Please give me my night brief now. Tell me about tomorrow. Call generate_brief with type "night".'
+
+      rt.send(JSON.stringify({
+        type: 'conversation.item.create',
+        item: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: prompt }],
+        },
+      }))
+      rt.send(JSON.stringify({ type: 'response.create' }))
+      break
+    }
+
     default:
-      console.warn(`[session ${sessionId}] Unknown control type: ${msg.type}`)
+      // Silently ignore unknown types (e.g. task.cancelled from UI)
+      break
   }
 }
 

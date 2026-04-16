@@ -101,37 +101,45 @@ export async function handleFunctionCall(
         break
       }
 
-      const gcalId = await createCalendarEvent(session.userId, title, due_at, notes ?? undefined)
-      console.log(`[actions] save_calendar_event "${title}" → gcalId: ${gcalId}`)
-      sendFunctionResult(rt, callId, {
-        success: !!gcalId,
-        gcal_id: gcalId,
-        message: gcalId
-          ? `Google Calendar event created: "${title}"`
-          : 'Failed to create Google Calendar event',
-      })
-
-      // Also surface in browser so the user sees it was logged
-      if (gcalId) {
-        sendBrowser(session.ws, {
-          type: 'task.pending_confirmation',
-          task: { title, type: 'event', due_at, notes },
-          callId,
+      try {
+        const gcalId = await createCalendarEvent(session.userId, title, due_at, notes ?? undefined)
+        console.log(`[actions] save_calendar_event "${title}" → gcalId: ${gcalId}`)
+        sendFunctionResult(rt, callId, {
+          success: !!gcalId,
+          gcal_id: gcalId,
+          message: gcalId
+            ? `Google Calendar event created: "${title}"`
+            : 'Failed to create Google Calendar event',
         })
+        if (gcalId) {
+          sendBrowser(session.ws, {
+            type: 'task.pending_confirmation',
+            task: { title, type: 'event', due_at, notes },
+            callId,
+          })
+        }
+      } catch (err) {
+        console.error('[actions] save_calendar_event error:', err)
+        sendFunctionResult(rt, callId, { success: false, message: 'Server error creating calendar event.' })
       }
       break
     }
 
     case 'mark_done': {
       const taskId = args.task_id as string
-      const { error } = await supabase
-        .from('tasks')
-        .update({ status: 'done' })
-        .eq('id', taskId)
-        .eq('user_id', session.userId)
-
-      sendFunctionResult(rt, callId, { success: !error, error: error?.message })
-      if (!error) sendBrowser(session.ws, { type: 'task.done', taskId })
+      try {
+        const { error } = await supabase
+          .from('tasks')
+          .update({ status: 'done' })
+          .eq('id', taskId)
+          .eq('user_id', session.userId)
+        if (error) throw error
+        sendFunctionResult(rt, callId, { success: true })
+        sendBrowser(session.ws, { type: 'task.done', taskId })
+      } catch (err) {
+        console.error('[actions] mark_done error:', err)
+        sendFunctionResult(rt, callId, { success: false, message: 'Failed to mark task done.' })
+      }
       break
     }
 
@@ -148,21 +156,82 @@ export async function handleFunctionCall(
         break
       }
 
-      const gtaskId = await createGoogleTask(session.userId, title, due_at ?? undefined, notes ?? undefined)
-      sendFunctionResult(rt, callId, {
-        success: !!gtaskId,
-        gtask_id: gtaskId,
-        message: gtaskId ? `Google Task created: "${title}"` : 'Failed to create Google Task',
-      })
+      try {
+        const gtaskId = await createGoogleTask(session.userId, title, due_at ?? undefined, notes ?? undefined)
+        sendFunctionResult(rt, callId, {
+          success: !!gtaskId,
+          gtask_id: gtaskId,
+          message: gtaskId ? `Google Task created: "${title}"` : 'Failed to create Google Task',
+        })
+      } catch (err) {
+        console.error('[actions] save_task_to_google error:', err)
+        sendFunctionResult(rt, callId, { success: false, message: 'Failed to create Google Task.' })
+      }
       break
     }
 
     case 'generate_brief': {
-      const briefType = args.type as string
-      sendFunctionResult(rt, callId, {
-        success: true,
-        brief: `${briefType === 'morning' ? 'Morning' : 'Night'} brief — full implementation in Phase 6.`,
-      })
+      const briefType = (args.type as string) === 'morning' ? 'morning' : 'night'
+      const ctx = session.context
+
+      try {
+        let events: { time: string; title: string }[]
+        let dateLabel: string
+
+        if (briefType === 'morning') {
+          events = ctx.todayEvents
+          dateLabel = ctx.today
+        } else {
+          // Night brief — use tomorrow's calendar events
+          const now = new Date()
+          const tomorrowDate = new Date(now)
+          tomorrowDate.setDate(tomorrowDate.getDate() + 1)
+          const tomorrowDateStr = tomorrowDate.toLocaleDateString('en-CA', { timeZone: ctx.timezone })
+
+          const tomorrowCalEvents = ctx.calendarEvents.filter(e => {
+            const eventDate = new Date(e.start).toLocaleDateString('en-CA', { timeZone: ctx.timezone })
+            return eventDate === tomorrowDateStr
+          })
+
+          dateLabel = tomorrowDate.toLocaleDateString('en-US', {
+            timeZone: ctx.timezone, weekday: 'long', month: 'long', day: 'numeric',
+          })
+
+          events = tomorrowCalEvents.map(e => ({
+            time: e.allDay ? 'All day' : new Date(e.start).toLocaleTimeString('en-US', {
+              timeZone: ctx.timezone, hour: 'numeric', minute: '2-digit',
+            }),
+            title: e.title,
+          }))
+        }
+
+        const upcomingTasks = ctx.upcomingTasks.slice(0, 5)
+        const briefSummary = events.length === 0
+          ? `No events scheduled for ${dateLabel}.`
+          : events.map(e => `${e.time}: ${e.title}`).join(' | ')
+
+        // Save brief to database
+        await supabase.from('briefs').insert({
+          user_id: session.userId,
+          type: briefType,
+          content: briefSummary,
+        })
+
+        console.log(`[actions] generate_brief "${briefType}" for ${session.userId} — ${events.length} events`)
+
+        sendFunctionResult(rt, callId, {
+          success: true,
+          brief_type: briefType,
+          date: dateLabel,
+          events,
+          event_count: events.length,
+          upcoming_tasks: upcomingTasks,
+          has_events: events.length > 0,
+        })
+      } catch (err) {
+        console.error('[actions] generate_brief error:', err)
+        sendFunctionResult(rt, callId, { success: false, message: 'Failed to load brief data.' })
+      }
       break
     }
 
